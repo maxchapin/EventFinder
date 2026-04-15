@@ -1,8 +1,9 @@
 """
 events_agent.py
 ───────────────
-Daily (or weekly) events digest for Cambridge, MA.
-Uses Claude with web search to find events, then sends a formatted email.
+Weekly events digest for Cambridge/Boston, MA.
+Scans specific websites in batches, asks Claude to extract events,
+then sends a clean formatted email.
 
 SETUP
 ─────
@@ -11,20 +12,17 @@ SETUP
 
 2. Create a .env file next to this script:
    ANTHROPIC_API_KEY=sk-ant-...
-   SENDGRID_API_KEY=SG....          # OR use RESEND_API_KEY below
-   # RESEND_API_KEY=re_...          # Alternative to SendGrid
+   SENDGRID_API_KEY=SG....       # OR use RESEND_API_KEY
+   # RESEND_API_KEY=re_...
 
 3. Run manually:
    python events_agent.py
 
-4. Schedule daily (cron example — runs at 8am):
-   0 8 * * * cd /path/to/script && python events_agent.py
-
-   OR use GitHub Actions (see README section at bottom of this file).
+4. Schedule (cron — 8am daily):
+   0 8 * * * cd /path/to/script && python3 events_agent.py >> events.log 2>&1
 """
 
 import os
-import json
 import datetime
 import requests
 from dotenv import load_dotenv
@@ -35,15 +33,7 @@ load_dotenv()
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
 CITY = "Cambridge, MA"
-RADIUS_MILES = 30
-CATEGORIES = [
-    "live music",
-    "festivals",
-    "hiking & nature",
-    "food & drink",
-    "comedy",
-    "markets & fairs",
-]
+RADIUS_MILES = 5
 CUSTOM_SITES = [
     "eventbrite.com",
     "bandsintown.com",
@@ -55,212 +45,257 @@ CUSTOM_SITES = [
     "https://massaicoalition.com/events",
 ]
 EMAIL_TO = "maxchapin430@gmail.com"
-EMAIL_FROM = "maxchapin430@gmail.com"  # ← change to your verified sender
-SEND_TIME = "08:00"
-FORMAT = "week"  # digest | top5 | week
-
-# Email provider: "sendgrid" or "resend"
-EMAIL_PROVIDER = "sendgrid"
+EMAIL_FROM = "events-digest@yourdomain.com"  # ← change to your verified sender
+FORMAT = "week"   # week | digest | top5
+BATCH_SIZE = 3    # sites per Claude call
+EMAIL_PROVIDER = "sendgrid"  # "sendgrid" or "resend"
 
 # ── DATE HELPERS ──────────────────────────────────────────────────────────────
 
 def get_date_window():
     today = datetime.date.today()
     if FORMAT == "week":
-        # Next 7 days
         end = today + datetime.timedelta(days=7)
         label = f"the week of {today.strftime('%B %d')}–{end.strftime('%B %d, %Y')}"
     elif FORMAT == "top5":
         end = today + datetime.timedelta(days=3)
         label = f"the next few days ({today.strftime('%B %d')}–{end.strftime('%B %d')})"
-    else:  # digest
+    else:
         end = today + datetime.timedelta(days=2)
         label = f"today and tomorrow ({today.strftime('%B %d')}–{end.strftime('%B %d')})"
     return today, end, label
 
-# ── CLAUDE AGENT ──────────────────────────────────────────────────────────────
+# ── PROMPTS ───────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a hyper-local events scout for the Boston/Cambridge area. 
-Your job is to find real, specific, upcoming events and return them in clean HTML 
-for an email digest. Only include events with confirmed dates, times, and venues.
-Do not fabricate events. If you cannot find details for something, skip it.
-Return ONLY the HTML body content — no markdown, no backticks, no preamble."""
+SYSTEM_PROMPT = """You are an event researcher for the Boston/Cambridge area.
+Your job is to scan websites and extract real upcoming events.
+Only include events with confirmed dates. Do not invent events.
+Return each event on its own line using this exact plain format:
+
+DATE | TIME | EVENT NAME | VENUE | NEIGHBORHOOD | DESCRIPTION (1 sentence) | URL | PRICE
+
+If any field is unknown, write "?" for it.
+Return nothing else — no headers, no intro, no markdown."""
 
 
-def build_user_prompt(today, end, label):
-    sites_formatted = "\n".join(f"  - {s}" for s in CUSTOM_SITES)
+def build_prompt(today, end, label, sites):
+    sites_formatted = "\n".join(f"  - {s}" for s in sites)
+    return f"""Scan these websites and extract all events happening in or near {CITY} for {label}:
 
-    return f"""You are scanning specific event websites to find what's happening in and around {CITY} for {label}.
-
-Check each of these sites thoroughly:
 {sites_formatted}
 
-Also do a broad web search for events in the Boston/Cambridge area during this period.
+Also search broadly for events in Boston/Cambridge during this period.
 
-For every event you find, include:
-- Event name
-- Date & time
-- Venue name and neighborhood
-- A 1–2 sentence description
-- Ticket/RSVP link (if available)
-- Price (if known; otherwise omit)
+Return every event you find. Today is {today.strftime('%A, %B %d, %Y')}.
+Only include events from today through {end.strftime('%B %d, %Y')}.
+Use the pipe-delimited format specified in your instructions."""
 
-Do not filter by category — include everything you find across all event types.
-Group events chronologically by date, not by category.
+# ── CLAUDE AGENT ──────────────────────────────────────────────────────────────
 
-Format each event as:
-<div style="margin-bottom: 20px; padding: 14px; background: #f9f9f9; border-left: 3px solid #333; border-radius: 4px;">
-  <strong style="font-size: 16px;">[Event Name]</strong><br>
-  <span style="color: #555; font-size: 14px;">📅 [Day, Date] · ⏰ [Time] · 📍 [Venue, Neighborhood]</span><br>
-  <p style="margin: 8px 0; font-size: 14px; color: #333;">[Description]</p>
-  [<a href="[link]" style="color: #0066cc; font-size: 13px;">Tickets / More info →</a>]
-</div>
-
-Use date headers to group them, like:
-<h2 style="font-family: Georgia, serif; color: #1a1a1a; border-bottom: 2px solid #e0e0e0; padding-bottom: 8px;">Friday, May 23</h2>
-
-Today is {today.strftime('%A, %B %d, %Y')}. Only include events from today through {end.strftime('%B %d, %Y')}."""
-
-def fetch_events_from_claude(today, end, label):
-    """Call Claude with web search enabled to find events."""
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-
-    prompt = build_user_prompt(today, end, label)
-
-    print("🔍 Asking Claude to search for events...")
-
+def fetch_batch(client, today, end, label, sites):
+    prompt = build_prompt(today, end, label, sites)
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=4000,
+        max_tokens=8000,
         system=SYSTEM_PROMPT,
-        tools=[
-            {
-                "type": "web_search_20250305",
-                "name": "web_search",
-            }
-        ],
+        tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=[{"role": "user", "content": prompt}],
     )
-
-    # Extract the final text response (after tool use)
-    html_content = ""
+    text = ""
     for block in response.content:
         if block.type == "text":
-            html_content += block.text
+            text += block.text
+    return text.strip()
 
-    return html_content.strip()
 
+def fetch_all_events(today, end, label):
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    batches = [CUSTOM_SITES[i:i+BATCH_SIZE] for i in range(0, len(CUSTOM_SITES), BATCH_SIZE)]
+    raw_lines = []
+
+    for i, batch in enumerate(batches):
+        print(f"  🔍 Batch {i+1}/{len(batches)}: {', '.join(batch)}")
+        result = fetch_batch(client, today, end, label, batch)
+        if result:
+            raw_lines.extend([l for l in result.splitlines() if "|" in l])
+
+    return raw_lines
+
+# ── EVENT PARSING ─────────────────────────────────────────────────────────────
+
+def parse_events(raw_lines):
+    events = []
+    seen = set()
+    for line in raw_lines:
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 7:
+            continue
+        date, time, name, venue, neighborhood, description, url, *rest = parts + ["?"] * 8
+        price = rest[0] if rest else "?"
+
+        # Deduplicate by name + date
+        key = (name.lower(), date.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        events.append({
+            "date": date,
+            "time": time,
+            "name": name,
+            "venue": venue,
+            "neighborhood": neighborhood,
+            "description": description,
+            "url": url,
+            "price": price,
+        })
+
+    # Sort by date string (best effort)
+    events.sort(key=lambda e: e["date"])
+    return events
 
 # ── EMAIL BUILDING ────────────────────────────────────────────────────────────
 
-def build_email_html(events_html, label):
+def event_card_html(e):
+    meta_parts = []
+    if e["time"] and e["time"] != "?":
+        meta_parts.append(e["time"])
+    location = " · ".join(p for p in [e["venue"], e["neighborhood"]] if p and p != "?")
+    if location:
+        meta_parts.append(f"📍 {location}")
+    meta = " · ".join(meta_parts)
+
+    price_html = ""
+    if e["price"] and e["price"].lower() == "free":
+        price_html = '<span style="color:#2a7a2a;font-size:12px;font-weight:600;background:#eaf6ea;padding:2px 7px;border-radius:4px;margin-left:6px;">Free</span>'
+    elif e["price"] and e["price"] != "?":
+        price_html = f'<span style="color:#666;font-size:13px;"> · {e["price"]}</span>'
+
+    link_html = ""
+    if e["url"] and e["url"] != "?":
+        link_html = f'<a href="{e["url"]}" style="display:inline-block;margin-top:8px;color:#0066cc;font-size:13px;text-decoration:none;">More info →</a>'
+
+    return f"""<tr>
+      <td style="padding:14px 0;border-bottom:1px solid #f0f0f0;vertical-align:top;">
+        <div style="font-size:15px;font-weight:600;color:#1a1a1a;margin-bottom:3px;">
+          {e["name"]}{price_html}
+        </div>
+        <div style="font-size:13px;color:#888888;margin-bottom:6px;">{meta}</div>
+        <div style="font-size:14px;color:#444444;line-height:1.55;">{e["description"]}</div>
+        {link_html}
+      </td>
+    </tr>"""
+
+
+def group_by_date(events):
+    groups = {}
+    for e in events:
+        groups.setdefault(e["date"], []).append(e)
+    return groups
+
+
+def build_email_html(events, label):
     today_str = datetime.date.today().strftime("%B %d, %Y")
+    groups = group_by_date(events)
+
+    sections_html = ""
+    for date, date_events in groups.items():
+        cards = "".join(event_card_html(e) for e in date_events)
+        sections_html += f"""
+        <tr>
+          <td style="padding-top:22px;padding-bottom:2px;">
+            <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:#aaaaaa;border-bottom:1px solid #eeeeee;padding-bottom:6px;">{date}</div>
+          </td>
+        </tr>
+        {cards}"""
+
+    if not sections_html:
+        sections_html = """<tr><td style="padding:24px 0;color:#888;font-size:14px;text-align:center;">
+            No events found this week. Try running again or check the sites directly.
+        </td></tr>"""
+
+    total = len(events)
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Your Events Digest</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
 </head>
-<body style="margin: 0; padding: 0; background-color: #f4f4f4; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f4f4f4; padding: 24px 0;">
-    <tr>
-      <td align="center">
-        <table width="600" cellpadding="0" cellspacing="0" style="max-width: 600px; width: 100%; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
-          
-          <!-- Header -->
-          <tr>
-            <td style="background-color: #1a1a1a; padding: 28px 32px;">
-              <h1 style="margin: 0; color: #ffffff; font-size: 22px; font-weight: 600; letter-spacing: -0.3px;">
-                📍 Cambridge & Boston Events
-              </h1>
-              <p style="margin: 6px 0 0; color: #aaaaaa; font-size: 14px;">
-                {label} · Sent {today_str}
-              </p>
-            </td>
-          </tr>
+<body style="margin:0;padding:0;background:#efefef;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:28px 0;">
+    <tr><td align="center">
+      <table width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;background:#ffffff;border-radius:10px;overflow:hidden;">
 
-          <!-- Events content -->
-          <tr>
-            <td style="padding: 28px 32px; color: #1a1a1a; font-size: 15px; line-height: 1.6;">
-              {events_html}
-            </td>
-          </tr>
+        <!-- Header -->
+        <tr>
+          <td style="background:#111111;padding:30px 36px 28px;">
+            <div style="font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:#666666;margin-bottom:10px;">Cambridge &amp; Boston</div>
+            <div style="font-size:24px;font-weight:700;color:#ffffff;line-height:1.2;margin-bottom:6px;">What's on this week</div>
+            <div style="font-size:13px;color:#888888;">{label} &nbsp;·&nbsp; {today_str} &nbsp;·&nbsp; {total} events</div>
+          </td>
+        </tr>
 
-          <!-- Footer -->
-          <tr>
-            <td style="background-color: #f9f9f9; padding: 20px 32px; border-top: 1px solid #e8e8e8;">
-              <p style="margin: 0; font-size: 12px; color: #999999; line-height: 1.6;">
-                This digest was generated by your personal events agent using Claude AI.<br>
-                Sources checked: {', '.join(CUSTOM_SITES[:4])} + web search.
-              </p>
-            </td>
-          </tr>
+        <!-- Events -->
+        <tr>
+          <td style="padding:4px 36px 28px;">
+            <table width="100%" cellpadding="0" cellspacing="0">
+              {sections_html}
+            </table>
+          </td>
+        </tr>
 
-        </table>
-      </td>
-    </tr>
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f7f7f7;padding:18px 36px;border-top:1px solid #eeeeee;">
+            <div style="font-size:12px;color:#bbbbbb;line-height:1.7;">
+              Generated by your events agent · Claude AI + web search<br>
+              Sources: {', '.join(CUSTOM_SITES[:5])}{'…' if len(CUSTOM_SITES) > 5 else ''}
+            </div>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
   </table>
 </body>
 </html>"""
-
 
 # ── EMAIL SENDING ─────────────────────────────────────────────────────────────
 
 def send_via_sendgrid(subject, html_body):
     api_key = os.environ.get("SENDGRID_API_KEY")
     if not api_key:
-        raise ValueError("SENDGRID_API_KEY not set in environment")
-
-    payload = {
-        "personalizations": [{"to": [{"email": EMAIL_TO}]}],
-        "from": {"email": EMAIL_FROM},
-        "subject": subject,
-        "content": [{"type": "text/html", "value": html_body}],
-    }
-
+        raise ValueError("SENDGRID_API_KEY not set")
     resp = requests.post(
         "https://api.sendgrid.com/v3/mail/send",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "personalizations": [{"to": [{"email": EMAIL_TO}]}],
+            "from": {"email": EMAIL_FROM},
+            "subject": subject,
+            "content": [{"type": "text/html", "value": html_body}],
         },
-        json=payload,
         timeout=15,
     )
-
     if resp.status_code not in (200, 202):
         raise RuntimeError(f"SendGrid error {resp.status_code}: {resp.text}")
-
-    print(f"✅ Email sent via SendGrid (status {resp.status_code})")
+    print(f"  ✅ Email sent via SendGrid ({resp.status_code})")
 
 
 def send_via_resend(subject, html_body):
     api_key = os.environ.get("RESEND_API_KEY")
     if not api_key:
-        raise ValueError("RESEND_API_KEY not set in environment")
-
-    payload = {
-        "from": EMAIL_FROM,
-        "to": [EMAIL_TO],
-        "subject": subject,
-        "html": html_body,
-    }
-
+        raise ValueError("RESEND_API_KEY not set")
     resp = requests.post(
         "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"from": EMAIL_FROM, "to": [EMAIL_TO], "subject": subject, "html": html_body},
         timeout=15,
     )
-
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
-
-    print(f"✅ Email sent via Resend (status {resp.status_code})")
+    print(f"  ✅ Email sent via Resend ({resp.status_code})")
 
 
 def send_email(subject, html_body):
@@ -269,44 +304,40 @@ def send_email(subject, html_body):
     else:
         send_via_sendgrid(subject, html_body)
 
-
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
     today, end, label = get_date_window()
 
-    print(f"📅 Finding events for: {label}")
-    print(f"📍 Location: {CITY} ({RADIUS_MILES}-mile radius)")
-    print(f"🏷️  Categories: {', '.join(CATEGORIES)}")
-    print()
+    print(f"📅 {label}")
+    print(f"📍 {CITY} · {len(CUSTOM_SITES)} sites · batch size {BATCH_SIZE}\n")
 
-    # 1. Fetch events from Claude
-    events_html = fetch_events_from_claude(today, end, label)
+    # 1. Fetch raw event lines from Claude (batched)
+    raw_lines = fetch_all_events(today, end, label)
+    print(f"\n  📋 Raw lines returned: {len(raw_lines)}")
 
-    if not events_html:
-        print("⚠️  No events content returned from Claude. Aborting.")
+    # 2. Parse and deduplicate
+    events = parse_events(raw_lines)
+    print(f"  🎯 Unique events after dedup: {len(events)}")
+
+    if not events:
+        print("  ⚠️  No events parsed. Check output above.")
         return
 
-    print(f"✅ Got {len(events_html)} chars of event content from Claude")
+    # 3. Build email
+    subject = f"📍 Cambridge & Boston — {today.strftime('%b %d')} · {len(events)} events this week"
+    html = build_email_html(events, label)
 
-    # 2. Build full email
-    subject_map = {
-        "week": f"📍 Your week in Cambridge & Boston — {today.strftime('%b %d')}",
-        "top5": f"📍 Top picks near Cambridge this weekend",
-        "digest": f"📍 Cambridge & Boston events — {today.strftime('%A, %b %d')}",
-    }
-    subject = subject_map.get(FORMAT, subject_map["week"])
-    full_html = build_email_html(events_html, label)
-
-    # 3. Optionally save a local preview
+    # 4. Save local preview
     preview_path = f"preview_{today.isoformat()}.html"
     with open(preview_path, "w") as f:
-        f.write(full_html)
-    print(f"💾 Local preview saved: {preview_path}")
+        f.write(html)
+    print(f"  💾 Preview saved: {preview_path}")
 
-    # 4. Send the email
-    print(f"📧 Sending to {EMAIL_TO}...")
-    send_email(subject, full_html)
+    # 5. Send
+    print(f"  📧 Sending to {EMAIL_TO}...")
+    send_email(subject, html)
+    print("\n✅ Done.")
 
 
 if __name__ == "__main__":
@@ -314,28 +345,16 @@ if __name__ == "__main__":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DEPLOYMENT OPTIONS
+# GITHUB ACTIONS WORKFLOW  (.github/workflows/main.yml)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# OPTION A — Cron on your Mac/Linux machine
-# ─────────────────────────────────────────
-# Edit your crontab:   crontab -e
-# Add this line (runs at 8am daily):
-#   0 8 * * * cd /path/to/script && /usr/bin/python3 events_agent.py >> events.log 2>&1
-#
-#
-# OPTION B — GitHub Actions (free, cloud, no machine needed)
-# ──────────────────────────────────────────────────────────
-# 1. Push this script to a private GitHub repo.
-# 2. Add ANTHROPIC_API_KEY and SENDGRID_API_KEY (or RESEND_API_KEY) as
-#    repository secrets (Settings → Secrets and variables → Actions).
-# 3. Create .github/workflows/events.yml with this content:
-#
 # name: Daily Events Digest
+#
 # on:
 #   schedule:
 #     - cron: '0 13 * * *'   # 8am EST = 1pm UTC
-#   workflow_dispatch:         # allows manual trigger from GitHub UI
+#   workflow_dispatch:
+#
 # jobs:
 #   send-digest:
 #     runs-on: ubuntu-latest
@@ -349,11 +368,8 @@ if __name__ == "__main__":
 #         env:
 #           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
-#
-#
-# OPTION C — Run locally on demand
-# ──────────────────────────────────
-# pip install anthropic requests python-dotenv
-# python events_agent.py
-#
-# ══════════════════════════════════════════════════════════════════════════════
+#       - uses: actions/upload-artifact@v4
+#         with:
+#           name: email-preview
+#           path: preview_*.html
+#           retention-days: 7
