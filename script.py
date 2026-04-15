@@ -89,19 +89,15 @@ Return ONLY the HTML body content — no markdown, no backticks, no preamble."""
 
 def build_user_prompt(today, end, label):
     sites_formatted = "\n".join(f"  - {s}" for s in CUSTOM_SITES)
-    cats_formatted = ", ".join(CATEGORIES)
 
-    return f"""Find events happening in and around {CITY} (within ~{RADIUS_MILES} miles) 
-for {label}.
+    return f"""You are scanning specific event websites to find what's happening in and around {CITY} for {label}.
 
-Categories to cover: {cats_formatted}
-
-Always check these specific sites/sources:
+Check each of these sites thoroughly:
 {sites_formatted}
 
-Also search broadly for events in the Boston/Cambridge metro area across these categories.
+Also do a broad web search for events in the Boston/Cambridge area during this period.
 
-For each event found, include:
+For every event you find, include:
 - Event name
 - Date & time
 - Venue name and neighborhood
@@ -109,31 +105,21 @@ For each event found, include:
 - Ticket/RSVP link (if available)
 - Price (if known; otherwise omit)
 
-Format the output as clean, readable HTML email body content. Use this structure:
+Do not filter by category — include everything you find across all event types.
+Group events chronologically by date, not by category.
 
-<h2 style="font-family: Georgia, serif; color: #1a1a1a; border-bottom: 2px solid #e0e0e0; padding-bottom: 8px;">🎵 Live Music</h2>
-[events in this category]
-
-Use these category headers (only include a section if you found events):
-- 🎵 Live Music
-- 🎉 Festivals & Big Events
-- 🌿 Hiking & Nature
-- 🍽️ Food & Drink
-- 😂 Comedy
-- 🛍️ Markets & Fairs
-
-Each event should be formatted as:
+Format each event as:
 <div style="margin-bottom: 20px; padding: 14px; background: #f9f9f9; border-left: 3px solid #333; border-radius: 4px;">
   <strong style="font-size: 16px;">[Event Name]</strong><br>
   <span style="color: #555; font-size: 14px;">📅 [Day, Date] · ⏰ [Time] · 📍 [Venue, Neighborhood]</span><br>
   <p style="margin: 8px 0; font-size: 14px; color: #333;">[Description]</p>
   [<a href="[link]" style="color: #0066cc; font-size: 13px;">Tickets / More info →</a>]
-  [<span style="font-size: 13px; color: #666;">💰 [Price]</span>]
 </div>
 
-Aim for 3–6 events per category. Prioritize variety across days of the week.
-Today's date is {today.strftime('%A, %B %d, %Y')}. Only include events from today through {end.strftime('%B %d, %Y')}."""
+Use date headers to group them, like:
+<h2 style="font-family: Georgia, serif; color: #1a1a1a; border-bottom: 2px solid #e0e0e0; padding-bottom: 8px;">Friday, May 23</h2>
 
+Today is {today.strftime('%A, %B %d, %Y')}. Only include events from today through {end.strftime('%B %d, %Y')}."""
 
 def fetch_events_from_claude(today, end, label):
     """Call Claude with web search enabled to find events."""
