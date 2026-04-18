@@ -23,6 +23,7 @@ SETUP
 """
 
 import os
+import time
 import datetime
 import requests
 from dotenv import load_dotenv
@@ -31,6 +32,11 @@ import anthropic
 load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
+# Rate-limit tuning: web_search can return 15-25k input tokens per call.
+# With a 30k TPM cap, only 1 site per call is safe.  Adjust BATCH_DELAY_SECONDS
+# (env var, default 90) if you still hit limits:
+#   BATCH_SIZE=1, DELAY=90  → safe for 30k TPM (default)
+#   BATCH_SIZE=1, DELAY=120 → extra headroom if still hitting limits
 
 CITY = "Cambridge, MA"
 RADIUS_MILES = 5
@@ -47,7 +53,8 @@ CUSTOM_SITES = [
 EMAIL_TO = "maxchapin430@gmail.com"
 EMAIL_FROM = "events-digest@yourdomain.com"  # ← change to your verified sender
 FORMAT = "week"   # week | digest | top5
-BATCH_SIZE = 3    # sites per Claude call
+BATCH_SIZE = 1    # one site per Claude call — keeps input tokens well under the 30k TPM limit
+BATCH_DELAY = int(os.environ.get("BATCH_DELAY_SECONDS", 90))  # seconds between API calls to stay under TPM
 EMAIL_PROVIDER = "sendgrid"  # "sendgrid" or "resend"
 
 # ── DATE HELPERS ──────────────────────────────────────────────────────────────
@@ -70,6 +77,10 @@ def get_date_window():
 SYSTEM_PROMPT = """You are an event researcher for the Boston/Cambridge area.
 Your job is to scan websites and extract real upcoming events.
 Only include events with confirmed dates. Do not invent events.
+Include ALL types of events: music, concerts, comedy, art, theater, film, food,
+sports, fitness, community, networking, tech, education, family, cultural,
+nightlife, festivals, markets, fairs, workshops, lectures, and anything else.
+Do NOT filter by category — return every event you find.
 Return each event on its own line using this exact plain format:
 
 DATE | TIME | EVENT NAME | VENUE | NEIGHBORHOOD | DESCRIPTION (1 sentence) | URL | PRICE
@@ -80,32 +91,50 @@ Return nothing else — no headers, no intro, no markdown."""
 
 def build_prompt(today, end, label, sites):
     sites_formatted = "\n".join(f"  - {s}" for s in sites)
-    return f"""Scan these websites and extract all events happening in or near {CITY} for {label}:
+    return f"""Scan these websites and extract ALL events happening in or near {CITY} for {label}:
 
 {sites_formatted}
 
 Also search broadly for events in Boston/Cambridge during this period.
 
-Return every event you find. Today is {today.strftime('%A, %B %d, %Y')}.
+Return EVERY event you find — do not limit to any particular category, type, or theme.
+Include concerts, sports, food, art, theater, comedy, community events, workshops, lectures, festivals, and all other types.
+Today is {today.strftime('%A, %B %d, %Y')}.
 Only include events from today through {end.strftime('%B %d, %Y')}.
 Use the pipe-delimited format specified in your instructions."""
 
 # ── CLAUDE AGENT ──────────────────────────────────────────────────────────────
 
+MAX_RETRIES = 5
+INITIAL_BACKOFF = 30  # seconds; doubles each retry
+
+
 def fetch_batch(client, today, end, label, sites):
     prompt = build_prompt(today, end, label, sites)
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=8000,
-        system=SYSTEM_PROMPT,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = ""
-    for block in response.content:
-        if block.type == "text":
-            text += block.text
-    return text.strip()
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8000,
+                system=SYSTEM_PROMPT,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = ""
+            for block in response.content:
+                if block.type == "text":
+                    text += block.text
+            return text.strip()
+        except anthropic.RateLimitError as exc:
+            retry_after = getattr(exc.response, "headers", {}).get("retry-after")
+            wait = int(retry_after) if retry_after else INITIAL_BACKOFF * (2 ** (attempt - 1))
+            if attempt == MAX_RETRIES:
+                raise
+            print(f"  ⚠️  Rate-limited (attempt {attempt}/{MAX_RETRIES}), retrying in {wait}s…")
+            time.sleep(wait)
+
+    return ""
 
 
 def fetch_all_events(today, end, label):
@@ -114,6 +143,9 @@ def fetch_all_events(today, end, label):
     raw_lines = []
 
     for i, batch in enumerate(batches):
+        if i > 0:
+            print(f"  ⏳ Waiting {BATCH_DELAY}s to stay under TPM limit…")
+            time.sleep(BATCH_DELAY)
         print(f"  🔍 Batch {i+1}/{len(batches)}: {', '.join(batch)}")
         result = fetch_batch(client, today, end, label, batch)
         if result:
