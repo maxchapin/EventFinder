@@ -51,7 +51,7 @@ CUSTOM_SITES = [
     "https://massaicoalition.com/events",
 ]
 EMAIL_TO = "maxchapin430@gmail.com"
-EMAIL_FROM = "events-digest@yourdomain.com"  # ← change to your verified sender
+EMAIL_FROM = "maxchapin430@gmail.com"  # ← change to your verified sender
 FORMAT = "week"   # week | digest | top5
 BATCH_SIZE = 1    # one site per Claude call — keeps input tokens well under the 30k TPM limit
 BATCH_DELAY = int(os.environ.get("BATCH_DELAY_SECONDS", 90))  # seconds between API calls to stay under TPM
